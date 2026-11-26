@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/chroma/*.lock
+.streamlit/secrets.toml
+.env
+data/users.json
+data/logs/
+data/kb_refresh_status.json
+data/eval/
+data/experiment.json
+
+data/smoke/
