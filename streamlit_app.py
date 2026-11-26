@@ -640,6 +640,18 @@ st.html(
     [class*="st-key-sector-card-"] p {
         color: #f2f6ff;
     }
+    [class*="st-key-sector-card-"] {
+        container-type: inline-size;  /* lets the title size itself to the card width */
+    }
+    [class*="st-key-sector-card-"] h3 {
+        font-size: min(1.75rem, 8.6cqi);  /* shrink long titles so every title stays on one line */
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    [class*="st-key-sector-card-"] [data-testid="stCaptionContainer"] {
+        min-height: 4.6em;  /* room for three lines of tickers, so descriptions line up across a row */
+    }
     [class*="st-key-sector-card-"] button {
         background: #19f39a;
         color: #04112d;
@@ -664,7 +676,8 @@ st.html(
         transform: translateY(-1px);
     }
     [class*="st-key-sector-card-active-"] {
-        border: 2px solid #19f39a;
+        border: 1px solid #19f39a;
+        border-top: 4px solid #19f39a;
         box-shadow: 0 0 0 3px rgba(25, 243, 154, 0.25), 0 12px 28px rgba(0, 0, 0, 0.25);
     }
     [class*="st-key-sector-card-active-"] button {
@@ -1115,10 +1128,11 @@ for row_start in range(0, len(SECTORS), 3):
             is_active = st.session_state.get("active_sector") == group["key"] and st.session_state.get(
                 "company_selection"
             ) == list(group["companies"])
-            with st.container(key=f"sector-card-{'active-' if is_active else ''}{group['key']}"):
-                st.subheader(group["title"])
+            with st.container(key=f"sector-card-{'active-' if is_active else ''}{group['key']}", height="stretch"):
+                st.subheader(group["title"], anchor=False)  # no anchor icon, so long titles don't wrap early
                 st.caption(" · ".join(_company_label(ticker) for ticker in group["companies"]))
                 st.write(group["description"])
+                st.space("stretch")  # pushes the button to the bottom so buttons line up across a row
                 st.button(
                     ("✓ " if is_active else "") + T("explore_button"),
                     key=f"sector-action-{group['key']}",
@@ -1432,7 +1446,7 @@ with analytics_tab:
                     color=alt.Color(
                         "revenue_growth:Q",
                         title="YoY growth",
-                        scale=alt.Scale(domain=[-limit, 0, limit], range=["#e34948", "#f0efec", "#2a78d6"], clamp=True),
+                        scale=alt.Scale(domain=[-limit, 0, limit], range=["#e34948", "#e6e6e6", "#2a78d6"], interpolate="lab", clamp=True),
                         legend=alt.Legend(format="%"),
                     ),
                     tooltip=[
