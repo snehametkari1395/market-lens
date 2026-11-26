@@ -1,16 +1,35 @@
+# Shared by both appearances. The Light/Dark/System switch in the app menu picks one of the sections below.
 [theme]
-base = "dark"
+font = "sans serif"
+baseRadius = "0.75rem"
+showWidgetBorder = true
+
+# Light: "Mint fresh"
+[theme.light]
+primaryColor = "#0f9d68"
+backgroundColor = "#f2fbf7"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0b1f44"
+borderColor = "#c9e9da"
+chartCategoricalColors = ["#0f9d68", "#1f5fd6", "#d97706", "#7c5ce0", "#d6406b"]
+
+[theme.light.sidebar]
+backgroundColor = "#e3f5ec"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0b1f44"
+borderColor = "#c9e9da"
+primaryColor = "#0f9d68"
+
+# Dark: the original navy + green
+[theme.dark]
 primaryColor = "#19f39a"
 backgroundColor = "#061536"
 secondaryBackgroundColor = "#0c2148"
 textColor = "#f2f6ff"
-font = "sans serif"
-baseRadius = "0.75rem"
-showWidgetBorder = true
 borderColor = "#203a66"
 chartCategoricalColors = ["#19f39a", "#69a8ff", "#ffba62", "#b69cff", "#ff7d9d"]
 
-[theme.sidebar]
+[theme.dark.sidebar]
 backgroundColor = "#04112d"
 secondaryBackgroundColor = "#0c2148"
 textColor = "#f2f6ff"
