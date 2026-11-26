@@ -79,3 +79,21 @@ def test_refresh_from_sec_button_runs(monkeypatch):
     at, _ = _start_as_guest(monkeypatch)
     next(button for button in at.button if button.label == "Refresh from SEC now").click().run()
     assert not at.exception, at.exception
+
+
+def test_exploring_a_sector_updates_the_analytics_and_events_pickers(monkeypatch):
+    at, _ = _start_as_guest(monkeypatch)
+    assert at.multiselect(key="analytics_tickers").value == ["AAPL", "MSFT"]
+    at.session_state["analytics_records"] = [{"ticker": "AAPL"}]  # results from an earlier analysis
+    at.session_state["analytics_order"] = ["AAPL", "MSFT"]
+    at.button(key="sector-action-semiconductors").click().run()
+    assert not at.exception, at.exception
+    semis = ["NVDA", "AMD", "INTC", "AVGO", "QCOM"]
+    assert at.multiselect(key="company_selection").value == semis
+    assert at.multiselect(key="analytics_tickers").value == semis
+    assert at.multiselect(key="event_tickers").value == semis
+    assert "analytics_records" not in at.session_state  # Apple's old results are gone
+
+    # Changing the main picker by hand keeps the other tabs in step too.
+    at.multiselect(key="company_selection").set_value(["JPM", "GS"]).run()
+    assert at.multiselect(key="analytics_tickers").value == ["JPM", "GS"]

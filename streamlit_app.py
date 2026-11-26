@@ -871,9 +871,28 @@ else:
 MAIN_TABS_KEY = f"main_tabs_{st.session_state['language']}"  # labels change with the language
 
 
+def _sync_company_pickers() -> None:
+    """Make the Analytics and Company events pickers follow the main company selection.
+
+    Each tab has its own picker (Analytics allows at most five companies), so without this they would keep
+    showing whichever companies they started with. Results for other companies are cleared, not left on screen.
+    """
+    selection = [ticker for ticker in st.session_state.get("company_selection", []) if ticker in TICKERS][:5]
+    if not selection:
+        return
+    for picker in ("analytics_tickers", "event_tickers"):
+        st.session_state[picker] = list(selection)
+    if st.session_state.get("analytics_order") != selection:
+        for stale in ("analytics_records", "analytics_prices", "analytics_order"):
+            st.session_state.pop(stale, None)
+    if (st.session_state.get("company_events") or {}).get("order") != selection:
+        st.session_state.pop("company_events", None)
+
+
 def _explore_sector(group: dict[str, Any]) -> None:
     """Runs before the page redraws: select the sector's companies, open the overview tab and load its data."""
     st.session_state["company_selection"] = list(group["companies"])
+    _sync_company_pickers()
     st.session_state["active_sector"] = group["key"]
     st.session_state["auto_load_overview"] = True
     st.session_state[MAIN_TABS_KEY] = T("tab_overview")
@@ -1054,6 +1073,7 @@ with st.sidebar:
         options=TICKERS,
         format_func=_company_label,
         key="company_selection",
+        on_change=_sync_company_pickers,
         help="Pick companies to compare, or use Explore companies on a sector card.",
     )
     if not is_guest and st.button(T("save_defaults"), icon=":material/bookmark:", width="stretch"):
@@ -1269,10 +1289,11 @@ with analytics_tab:
         "Growth, profitability and efficiency computed from SEC-reported annual figures. "
         "Ratios are derived values; check the underlying filings before relying on them."
     )
+    # Starting value via session state: _sync_company_pickers sets it later, and a widget default would clash.
+    st.session_state.setdefault("analytics_tickers", [t for t in selected_tickers if t in TICKERS][:5] or ["AAPL", "MSFT"])
     analytics_tickers = st.multiselect(
         T("companies"),
         options=TICKERS,
-        default=[t for t in selected_tickers if t in TICKERS][:5] or ["AAPL", "MSFT"],
         format_func=_company_label,
         max_selections=5,
         key="analytics_tickers",
@@ -1697,10 +1718,10 @@ with events_tab:
         "of events such as earnings, executive changes, deals or cybersecurity incidents."
     )
     with st.container(horizontal=True, vertical_alignment="bottom"):
+        st.session_state.setdefault("event_tickers", [t for t in selected_tickers if t in TICKERS][:5] or ["AAPL", "MSFT"])
         event_tickers = st.multiselect(
             T("companies"),
             options=TICKERS,
-            default=[t for t in selected_tickers if t in TICKERS][:5] or ["AAPL", "MSFT"],
             format_func=_company_label,
             max_selections=5,
             key="event_tickers",
