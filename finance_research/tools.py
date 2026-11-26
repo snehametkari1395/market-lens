@@ -7,6 +7,8 @@ import requests
 from langchain_core.tools import tool
 
 from finance_research.events import get_company_events
+from finance_research.market import earnings_calendar, get_quote, normalize_ticker, upcoming_for
+from finance_research.valuation import get_valuation as _get_valuation
 from finance_research.private_companies import PRIVATE_COMPANIES, get_private_funding
 from finance_research.rag import DEFAULT_STRATEGY, SEARCH_STRATEGIES, search_filings
 from finance_research.security import sanitize_untrusted
@@ -52,7 +54,7 @@ def _ratio_records(
         numerator_value = numerator_by_year[fiscal_year]["value_usd"]
         denominator_value = denominator_by_year[fiscal_year]["value_usd"]
         if denominator_value == 0:
-            raise ValueError(f"{ratio} is undefined because revenue is zero.")
+            raise ValueError(f"{ratio} is undefined because {denominator_metric.replace('_', ' ')} is zero.")
         value = numerator_value / denominator_value * 100
         inputs = {
             numerator_metric: numerator_value,
@@ -87,16 +89,22 @@ def _ratio_records(
 TOOL_DESCRIPTIONS = {
     "fetch_sec_financials": "Fetch annual financial figures from SEC company facts. Metric must be one of: "
     + ", ".join(METRICS) + ".",
-    "calculate_financial_ratio": "Calculate revenue_growth, operating_margin, net_margin, or research_intensity "
+    "calculate_financial_ratio": "Calculate revenue_growth, operating_margin, net_margin, research_intensity or "
+    "payout_ratio (dividends paid / net income) "
     "for one company and fiscal year using SEC figures.",
     "compare_companies": "Compare a supported SEC financial metric across two to five public-company tickers.",
-    "search_filing_knowledge": "Search ingested SEC 10-K filing passages and return excerpts with section/year/source "
+    "search_filing_knowledge": "Search ingested SEC annual-report passages (10-K, or 20-F for European companies) and return excerpts with section/year/source "
     "citations. Write the question in English: the filings are in English. Leave report_year out to search the "
     "latest indexed filings; only set it when the user asks about a specific fiscal year.",
     "fetch_stock_quote": "Fetch a latest stock quote from Alpha Vantage; requires a user-provided API key.",
     "get_company_events": "List a company's recent major events from SEC Form 8-K filings (earnings releases, "
     "executive changes, acquisitions, financing, cybersecurity incidents) with filing dates and links. "
     "days is how far back to look (1-730, default 180).",
+    "get_upcoming_earnings": "Get the next scheduled earnings report date (and EPS estimate when available) for one "
+    "to ten tickers, from the Alpha Vantage earnings calendar covering the next three months.",
+    "get_valuation": "Get a public company's latest share price and valuation: market cap, P/E, price-to-sales, "
+    "price-to-book, enterprise value / revenue and dividend yield. Price from Yahoo Finance; earnings, revenue, "
+    "equity, debt, cash and shares from SEC filings (latest fiscal year).",
     "get_private_company_funding": "Get a US private company's funding history from SEC Form D filings: amount "
     "raised per offering, first-sale date, number of investors and security type. No revenue, profit or valuation. "
     "Works only for: " + ", ".join(company["name"] for company in PRIVATE_COMPANIES.values()) + ".",
@@ -180,7 +188,7 @@ class ToolKit:
         }
         if not results:
             return {
-                "message": f"No indexed filing passages found for {ticker.upper()}. Ingest its 10-K filings first.",
+                "message": f"No indexed filing passages found for {ticker.upper()}. Index its annual report (10-K or 20-F) first.",
                 "results": [],
                 "retrieval": retrieval,
             }
@@ -216,6 +224,23 @@ class ToolKit:
             ],
             "note": "Item codes say what kind of event was reported; open the filing for the details.",
         }
+
+    def get_upcoming_earnings(self, tickers: list[str]) -> dict[str, Any]:
+        wanted = list(dict.fromkeys(normalize_ticker(ticker) for ticker in tickers))[:10]
+        if not wanted:
+            raise ValueError("Give at least one ticker.")
+        events = upcoming_for(earnings_calendar(self.market_data_key), wanted, days=92)
+        found = {event["ticker"] for event in events}
+        return {
+            "earnings": events,
+            "not_scheduled": [ticker for ticker in wanted if ticker not in found],
+            "source": "Alpha Vantage earnings calendar",
+            "note": "Dates are companies' expected report dates and can move.",
+        }
+
+    def get_valuation(self, ticker: str) -> dict[str, Any]:
+        result = _get_valuation(ticker, self.user_agent, get_quote(ticker))
+        return {**result, "ratio": "valuation", "price_source": "Yahoo Finance"}
 
     def get_private_company_funding(self, company: str) -> dict[str, Any]:
         return get_private_funding(company, self.user_agent)
@@ -275,6 +300,14 @@ def build_tools(
     def get_company_events_tool(ticker: str, days: int = 180) -> str:
         return _json(kit.get_company_events(ticker, days))
 
+    @tool(description=TOOL_DESCRIPTIONS["get_upcoming_earnings"])
+    def get_upcoming_earnings(tickers: list[str]) -> str:
+        return _json(kit.get_upcoming_earnings(tickers))
+
+    @tool(description=TOOL_DESCRIPTIONS["get_valuation"])
+    def get_valuation(ticker: str) -> str:
+        return _json(kit.get_valuation(ticker))
+
     @tool(description=TOOL_DESCRIPTIONS["get_private_company_funding"])
     def get_private_company_funding(company: str) -> str:
         return _json(kit.get_private_company_funding(company))
@@ -286,5 +319,7 @@ def build_tools(
         search_filing_knowledge,
         fetch_stock_quote,
         get_company_events_tool,
+        get_upcoming_earnings,
+        get_valuation,
         get_private_company_funding,
     ]

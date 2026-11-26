@@ -19,7 +19,7 @@ Market Lens is a Streamlit research assistant for comparing public companies usi
 - Token usage and cost under every answer, plus session totals in the sidebar (priced from OpenRouter's public model list)
 - "Tool results, visualised": a timeline of each tool call plus charts of fetched SEC figures, ratio inputs, and quotes
 - Conversation export as PDF, CSV, Markdown, or JSON
-- Prompt-injection protection: blocks rule-override questions, redacts instruction-like text in retrieved filing excerpts and MCP results and marks them as untrusted data, and withholds answers that leak the system prompt
+- Basic prompt-injection checks (pattern matching, so they reduce the risk rather than remove it): blocks rule-override questions, redacts instruction-like text in retrieved filing excerpts and MCP results and marks them as untrusted data, and withholds answers that leak the system prompt
 - Multi-model support: OpenRouter (any model), OpenAI direct, or Anthropic Claude direct via the official Anthropic SDK (with server-side refusal fallbacks enabled)
 - Real-time knowledge-base updates: check SEC EDGAR for new 10-Ks and index only the new ones, manually or every 30 minutes; "Refresh from SEC now" bypasses the one-hour data cache
 - User accounts (salted PBKDF2 password hashes in `data/users.json`) with saved preferences: watchlist, metric, history length, provider, model, and MCP setting; guest mode available
@@ -34,6 +34,7 @@ Market Lens is a Streamlit research assistant for comparing public companies usi
 - Financial health and valuation: liabilities ÷ assets, debt-to-equity, net cash, diluted EPS and price-to-earnings (P/E)
 - 10-year share-price history: growth of $1,000 (dividend-adjusted) or traded price, with total and annual return and worst drawdown; Alpha Vantage when a key is set, otherwise Yahoo Finance's public chart service
 - Company events: recent SEC Form 8-K filings (earnings, executive changes, deals, financing, cybersecurity incidents) on a timeline and list, with optional AI summaries of each filing and its press release; also available to the chat assistant as a tool
+- European companies: 10 US-listed European firms (German: SAP, Deutsche Bank, Fresenius Medical Care, BioNTech, Evotec; plus ASML, Novo Nordisk, AstraZeneca, Unilever, Shell). The app reads their 20-F reports and IFRS figures, converts euros/kroner to US dollars at yearly average rates, and adjusts per-share figures to one US-listed share (ADR). SAP's and ASML's 20-Fs are in the knowledge base.
 - One-click example questions in the chat, built from the companies selected in the sidebar
 - Factor scorecard: 0–100 scores on eight factors (growth, profitability, efficiency, cash quality, financial health, consistency, innovation, shareholder return) using fixed, published scales and adjustable weights; a transparent summary, not a recommendation
 - The research tools as an MCP server (`finance_research/mcp_server.py`), usable by any MCP client and selectable as the assistant's tool source in the app
@@ -182,7 +183,8 @@ The tools: SEC financials, ratio calculation, company comparison, filing search,
 ## Current limitations
 
 **Data**
-- Only US companies that file 10-Ks with the SEC, using US-GAAP labels. Companies choose different labels for the same item, so some figures are missing or not exactly comparable (banks report revenue differently, for example).
+- Only companies that report to the US SEC: US companies (10-K, US-GAAP) and foreign companies listed in the US (20-F, usually IFRS). European companies that are not US-listed (Siemens, BMW, Volkswagen…) are not covered. Companies choose different labels for the same item, so some figures are missing or not exactly comparable (banks report revenue differently, Shell tags its EPS with its own label, Deutsche Bank's recent 20-Fs tag only a few figures).
+- European figures are converted to US dollars with approximate yearly average exchange rates kept in the code (EUR, GBP, CHF, DKK); other currencies are skipped. Part of a year-to-year change can come from the exchange rate.
 - Fiscal years end in different months (Apple in September, Microsoft in June, Walmart in January), so "the same year" covers different periods.
 - Annual figures only; quarterly (10-Q) data is not used yet.
 - Share prices are monthly. Without an Alpha Vantage key they come from Yahoo Finance's unofficial chart service, which may change or limit requests.

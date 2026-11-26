@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests
 
@@ -34,20 +37,61 @@ class _Bucket:
 class RateLimiter:
     """Sliding-window limiter keyed by user. Thread-safe so it can be shared across sessions."""
 
-    def __init__(self, limits: RateLimits | None = None, clock=time.time) -> None:
+    def __init__(self, limits: RateLimits | None = None, clock=time.time, state_path: str | Path | None = None) -> None:
         self.limits = limits or RateLimits()
         self._clock = clock
         self._buckets: dict[str, _Bucket] = {}
         self._lock = threading.Lock()
+        # Spending is saved here so a restart doesn't reset the daily budgets (request counts are short-lived).
+        self._state_path = Path(state_path) if state_path else None
+        self._load_spend()
+
+    def _load_spend(self) -> None:
+        if not self._state_path or not self._state_path.exists():
+            return
+        try:
+            saved = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # a damaged file only means budgets start fresh
+        now = self._clock()
+        for user, entries in (saved.get("spend") or {}).items():
+            recent = [(float(stamp), float(usd)) for stamp, usd in entries if now - float(stamp) < 86400]
+            if recent:
+                self._buckets.setdefault(user, _Bucket()).spend.extend(sorted(recent))
+
+    def _save_spend(self) -> None:
+        if not self._state_path:
+            return
+        data = {"spend": {user: list(bucket.spend) for user, bucket in self._buckets.items() if bucket.spend}}
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._state_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(temporary, self._state_path)
+        except OSError:
+            pass  # limits still work in memory
+
+    def _prune(self) -> None:
+        """Forget users with nothing left in their windows, so the table doesn't grow forever."""
+        for user in [user for user, bucket in self._buckets.items() if not bucket.requests and not bucket.spend]:
+            del self._buckets[user]
 
     def _bucket(self, user: str) -> _Bucket:
-        bucket = self._buckets.setdefault(user, _Bucket())
         now = self._clock()
+        if len(self._buckets) > 1000:
+            for bucket in self._buckets.values():
+                self._trim(bucket, now)
+            self._prune()
+        bucket = self._buckets.setdefault(user, _Bucket())
+        self._trim(bucket, now)
+        return bucket
+
+    @staticmethod
+    def _trim(bucket: _Bucket, now: float) -> None:
         while bucket.requests and now - bucket.requests[0] >= 3600:
             bucket.requests.popleft()
         while bucket.spend and now - bucket.spend[0][0] >= 86400:
             bucket.spend.popleft()
-        return bucket
 
     def check(self, user: str, limits: RateLimits | None = None) -> None:
         """Record a request, or raise RateLimitExceeded without recording it."""
@@ -80,6 +124,7 @@ class RateLimiter:
         if usd:
             with self._lock:
                 self._bucket(user).spend.append((self._clock(), float(usd)))
+                self._save_spend()
 
     def status(self, user: str, limits: RateLimits | None = None) -> dict[str, float]:
         limits = limits or self.limits

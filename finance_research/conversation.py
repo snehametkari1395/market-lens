@@ -554,7 +554,8 @@ HELP_TOPICS: list[dict[str, Any]] = [
             "Market Lens guards against attempts to hijack the assistant in three ways: questions that try "
             "to override its rules are blocked; instruction-like text inside retrieved 10-K excerpts is "
             "removed and the rest is marked as untrusted data; and an answer that repeats the assistant's "
-            "internal instructions is withheld. All tools are read-only, so the model can't change anything."
+            "internal instructions is withheld. These are pattern checks, so a cleverly worded attack can still get "
+            "through; the bigger safeguard is that all tools are read-only, so the model can't change anything."
         ),
     },
     {
@@ -595,6 +596,8 @@ HELP_TOPICS: list[dict[str, Any]] = [
 
 HELP_SUGGESTIONS = [
     "How do I get started?",
+    "What is a 10-K?",
+    "What does net margin mean?",
     "Why do I need an OpenRouter key?",
     "How do I index filings?",
     "How does retrieval work?",
@@ -626,10 +629,17 @@ def answer_help_question(question: str) -> dict[str, str]:
         if score > best_score:
             best_topic, best_score = topic, score
 
+    from finance_research.glossary import is_definition_question, lookup_term
+
+    term = lookup_term(question)
+    if term and (best_topic is None or is_definition_question(question)):
+        return {"title": term["term"], "answer": f"{term['meaning']}\n\n**Why it matters:** {term['why']}"}
+
     if best_topic is None:
         menu = "\n".join(f"- {topic['title']}" for topic in HELP_TOPICS)
         return {
             "title": "Topics I can help with",
-            "answer": "I'm not sure about that one. Try asking about one of these:\n\n" + menu,
+            "answer": "I'm not sure about that one. Ask what a term means (e.g. “What is a 10-K?”) or about one of these:\n\n"
+            + menu,
         }
     return {"title": best_topic["title"], "answer": best_topic["answer"]}

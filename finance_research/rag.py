@@ -60,7 +60,7 @@ def ingest_recent_filings(
 ) -> int:
     filings = get_recent_10k_filings(ticker, years, user_agent)
     if not filings:
-        raise ValueError(f"No recent 10-K filings were found for {ticker.upper()}.")
+        raise ValueError(f"No recent annual reports (10-K or 20-F) were found for {ticker.upper()}.")
     if skip_indexed:
         filings = [filing for filing in filings if not is_filing_indexed(vector_store, filing)]
 

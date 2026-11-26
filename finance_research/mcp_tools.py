@@ -9,8 +9,10 @@ Two kinds of server:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import re
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -38,7 +40,34 @@ def validate_mcp_url(url: str, allow_local: bool = False) -> str:
         raise ValueError("Enter an https:// URL for the MCP server.")
     if is_local or host == "0.0.0.0" or host.endswith(".local"):
         raise ValueError("Only public remote MCP servers are supported.")
+    if not _resolves_to_public_addresses(host, parsed.port or 443):
+        raise ValueError("Only public remote MCP servers are supported (this address is private or can't be found).")
     return url.strip()
+
+
+def _is_public_ip(address: str) -> bool:
+    ip = ipaddress.ip_address(address.split("%", 1)[0])  # drop an IPv6 zone id such as %eth0
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_global and not ip.is_multicast
+
+
+def _resolves_to_public_addresses(host: str, port: int) -> bool:
+    """True only if every address the host name points to is on the public internet.
+
+    Stops the server from being used to reach machines on the local network or cloud metadata
+    endpoints (e.g. 169.254.169.254), including through names that resolve to private IPs.
+    """
+    try:
+        return _is_public_ip(host)  # a literal IP address
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, UnicodeError):
+        return False
+    addresses = {info[4][0] for info in infos}
+    return bool(addresses) and all(_is_public_ip(address) for address in addresses)
 
 
 async def _with_session(url: str, action):

@@ -41,8 +41,12 @@ class Monitor:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.log_dir / "events.jsonl"
         self.logger = logging.getLogger("market_lens")
-        if not any(isinstance(h, RotatingFileHandler) for h in self.logger.handlers):
-            handler = RotatingFileHandler(self.log_dir / "market_lens.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        log_file = (self.log_dir / "market_lens.log").resolve()
+        # The logger is shared by the whole process: add a handler once per log file, not once in total.
+        if not any(
+            isinstance(h, RotatingFileHandler) and Path(h.baseFilename).resolve() == log_file for h in self.logger.handlers
+        ):
+            handler = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
             self.logger.addHandler(handler)
             self.logger.setLevel(logging.INFO)

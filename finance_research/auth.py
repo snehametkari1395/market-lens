@@ -30,6 +30,8 @@ DEFAULT_PREFERENCES: dict[str, Any] = {
     "search_strategy": "hybrid",
     "tool_source": "builtin",
 }
+# Per-user lists kept beside the preferences (validated by finance_research.portfolio before saving).
+USER_LISTS = ("watchlist_items", "holdings", "alerts")
 _lock = threading.Lock()
 
 
@@ -124,6 +126,19 @@ class UserStore:
 
     def exists(self, username: str) -> bool:
         return username.strip().lower() in self._load()["users"]
+
+    def get_lists(self, username: str) -> dict[str, list[Any]]:
+        """The user's saved watchlist, portfolio holdings and price alerts."""
+        user = self._load()["users"].get(username.strip().lower(), {})
+        return {key: list(user.get(key, [])) for key in USER_LISTS}
+
+    def save_list(self, username: str, key: str, items: list[Any]) -> None:
+        if key not in USER_LISTS:
+            raise ValueError(f"Unknown list: {key}.")
+        with _lock:
+            data = self._load()
+            data["users"][username.strip().lower()][key] = items
+            self._save(data)
 
     def update_preferences(self, username: str, preferences: dict[str, Any]) -> dict[str, Any]:
         allowed = {key: value for key, value in preferences.items() if key in DEFAULT_PREFERENCES}

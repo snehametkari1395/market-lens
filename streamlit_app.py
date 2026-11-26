@@ -28,12 +28,25 @@ from finance_research.analytics import (
 )
 from finance_research.events import CATEGORIES as EVENT_CATEGORIES
 from finance_research.events import event_text, get_company_events
+from finance_research.market import (
+    PRICE_RANGES,
+    TICKER_PATTERN,
+    earnings_calendar,
+    get_quote,
+    ipo_calendar,
+    normalize_ticker,
+    price_series,
+    upcoming_for,
+)
+from finance_research.valuation import VALUATION_NOTE, get_valuation
+from finance_research.portfolio import ALERT_CONDITIONS, clean_alerts, clean_holdings, clean_watchlist, triggered_alerts, value_holdings
 from finance_research.private_companies import FORM_D_NOTE, PRIVATE_COMPANIES, get_private_funding
 from finance_research.events import summary_prompt as event_summary_prompt
 from finance_research.factcheck import verify_answer
 from finance_research.prices import PriceDataError, fetch_price_history, indexed_prices, price_growth
 from finance_research.evaluation import evaluate_generation, evaluate_retrieval, generate_test_set, list_runs, save_run
 from finance_research.experiments import Experiment, assign_variant, summarize_experiment, verdict
+from finance_research.glossary import APP_IN_ONE_LINE, GLOSSARY, QUICK_START, TAB_TOUR, search_glossary
 from finance_research.i18n import LANGUAGES, translate
 from finance_research.mcp_server import LocalServer
 from finance_research.scheduler import KnowledgeBaseScheduler, SchedulerConfig, task_scheduler_command
@@ -47,7 +60,7 @@ from finance_research.conversation import (
     extract_citations,
     format_citations_markdown,
 )
-from finance_research.auth import AuthError, UserStore
+from finance_research.auth import USER_LISTS, AuthError, UserStore
 from finance_research.mcp_tools import DEFAULT_MCP_URL, MCPError, build_mcp_tools, list_mcp_tools
 from finance_research.monitoring import Monitor, summarize_events
 from finance_research.providers import PROVIDERS, price_for
@@ -63,7 +76,15 @@ from finance_research.rag import (
     search_filings,
 )
 from finance_research.ratelimit import RateLimiter, RateLimitExceeded, RateLimits, mask_key, openrouter_balance, verify_api_key
-from finance_research.sec_client import METRICS, TOTAL_METRICS, SECClientError, clear_sec_cache, get_metric_records, validate_sec_user_agent
+from finance_research.sec_client import (
+    METRICS,
+    TOTAL_METRICS,
+    SECClientError,
+    clear_sec_cache,
+    find_company,
+    get_metric_records,
+    validate_sec_user_agent,
+)
 from finance_research.screening import build_research_shortlist
 from finance_research.security import PromptInjectionError, check_user_question, strip_untrusted_markers
 from finance_research.tools import build_tools
@@ -147,16 +168,71 @@ SECTORS = [
         "companies": {"BKNG": "Booking Holdings", "MAR": "Marriott", "HLT": "Hilton", "DAL": "Delta Air Lines", "UAL": "United Airlines"},
         "description": "Airlines, hotels, and online booking, sensitive to demand and fuel costs.",
     },
+    {
+        "key": "germany",
+        "title": "German companies",
+        "companies": {"SAP": "SAP", "DB": "Deutsche Bank", "FMS": "Fresenius Medical Care", "BNTX": "BioNTech", "EVO": "Evotec"},
+        "description": "German firms listed in the US. They file a 20-F; euro figures are shown in US dollars.",
+    },
+    {
+        "key": "europe",
+        "title": "European leaders",
+        "companies": {"ASML": "ASML (Netherlands)", "NVO": "Novo Nordisk (Denmark)", "AZN": "AstraZeneca (UK)", "UL": "Unilever (UK)", "SHEL": "Shell (UK)"},
+        "description": "Europe's giants in chips, pharma, consumer goods and energy, compared in US dollars.",
+    },
 ]
+# Companies that report in their home currency and file a 20-F instead of a 10-K.
+FOREIGN_TICKERS = {"SAP", "DB", "FMS", "BNTX", "EVO", "ASML", "NVO", "AZN", "UL", "SHEL"}
 # Banks' deposits are liabilities by design, so balance-sheet "health" ratios don't compare fairly with other companies.
-BANK_TICKERS = {"JPM", "BAC", "GS"}
+BANK_TICKERS = {"JPM", "BAC", "GS", "DB"}
 COMPANY_NAMES = {ticker: name for sector in SECTORS for ticker, name in sector["companies"].items()}
 TICKERS = list(COMPANY_NAMES)
 
 
+def _ticker_options() -> list[str]:
+    """The built-in companies plus any US ticker the user added this session (checked against the SEC list)."""
+    return TICKERS + [ticker for ticker in st.session_state.get("extra_tickers", {}) if ticker not in COMPANY_NAMES]
+
+
 def _company_label(ticker: str) -> str:
-    name = COMPANY_NAMES.get(ticker)
-    return f"{name} ({ticker})" if name else ticker
+    name = COMPANY_NAMES.get(ticker) or st.session_state.get("extra_tickers", {}).get(ticker)
+    return f"{name} ({ticker})" if name and name != ticker else ticker
+
+
+def _register_new_tickers(selection: list[str], email: str) -> None:
+    """Check tickers typed into the company picker against the SEC company list; keep the real ones."""
+    extras = st.session_state.setdefault("extra_tickers", {})
+    kept, rejected = [], []
+    for raw in selection:
+        if raw in TICKERS or raw in extras:
+            kept.append(raw)
+            continue
+        try:
+            ticker = normalize_ticker(raw)
+            if ticker in TICKERS or ticker in extras:
+                kept.append(ticker)
+                continue
+            try:
+                user_agent = validate_sec_user_agent(email)
+            except ValueError:
+                extras[ticker] = ticker  # no SEC email yet: accept it; data loads will explain what's missing
+            else:
+                extras[ticker] = _pretty_company_name(find_company(ticker, user_agent)["name"])
+            kept.append(ticker)
+        except (ValueError, SECClientError, RequestException):
+            rejected.append(raw)
+    kept = list(dict.fromkeys(kept))
+    if kept != selection:
+        st.session_state["pending_selection"] = kept
+        if rejected:
+            st.session_state["ticker_notice"] = rejected
+        st.rerun()
+    _sync_company_pickers()
+
+
+def _pretty_company_name(name: str) -> str:
+    """'NETFLIX INC' -> 'Netflix Inc'; names already in mixed case are left alone."""
+    return name.title() if name.isupper() else name
 
 
 
@@ -204,8 +280,9 @@ def _monitor() -> Monitor:
 
 @st.cache_resource(show_spinner=False)
 def _rate_limiter() -> RateLimiter:
-    """One limiter shared by every browser session, so opening new tabs doesn't reset the limits."""
-    return RateLimiter()
+    """One limiter shared by every browser session, so opening new tabs doesn't reset the limits.
+    Spending is saved to disk, so restarting the app doesn't reset the daily budgets either."""
+    return RateLimiter(state_path=os.getenv("MARKET_LENS_RATELIMIT_FILE") or DATA_DIR / "ratelimit_state.json")
 
 
 @st.cache_resource(show_spinner=False)
@@ -307,12 +384,15 @@ TOOL_LABELS = {
     "fetch_stock_quote": "Stock quote",
     "get_company_events": "Company events (8-K)",
     "get_private_company_funding": "Private-company funding (Form D)",
+    "get_upcoming_earnings": "Earnings calendar",
+    "get_valuation": "Price & valuation",
 }
 RATIO_LABELS = {
     "revenue_growth": "Revenue growth",
     "operating_margin": "Operating margin",
     "net_margin": "Net margin",
     "research_intensity": "R&D intensity",
+    "payout_ratio": "Dividend payout ratio",
 }
 
 
@@ -703,7 +783,11 @@ user_store = _user_store()
 
 def _apply_preferences(preferences: dict[str, Any]) -> None:
     """Load a user's saved defaults into the widgets' session state."""
-    st.session_state["company_selection"] = [t for t in preferences.get("watchlist", []) if t in TICKERS] or ["AAPL", "MSFT"]
+    extras = st.session_state.setdefault("extra_tickers", {})
+    for ticker in preferences.get("watchlist", []):
+        if ticker not in TICKERS and TICKER_PATTERN.match(str(ticker)):
+            extras.setdefault(ticker, ticker)  # saved tickers outside the built-in list stay selectable
+    st.session_state["company_selection"] = [t for t in preferences.get("watchlist", []) if t in _ticker_options()] or ["AAPL", "MSFT"]
     if preferences.get("default_metric") in METRICS:
         st.session_state["dashboard_metric"] = preferences["default_metric"]
     st.session_state["years"] = int(preferences.get("years") or 5)
@@ -890,7 +974,7 @@ def _sync_company_pickers() -> None:
     Each tab has its own picker (Analytics allows at most five companies), so without this they would keep
     showing whichever companies they started with. Results for other companies are cleared, not left on screen.
     """
-    selection = [ticker for ticker in st.session_state.get("company_selection", []) if ticker in TICKERS][:5]
+    selection = [ticker for ticker in st.session_state.get("company_selection", []) if ticker in _ticker_options()][:5]
     if not selection:
         return
     for picker in ("analytics_tickers", "event_tickers"):
@@ -1081,14 +1165,24 @@ with st.sidebar:
     search_strategy = ab_strategy or st.session_state["search_strategy"]
 
     years = st.slider(T("history"), min_value=1, max_value=10, key="years")
+    if "pending_selection" in st.session_state:  # corrected by _register_new_tickers on the previous run
+        st.session_state["company_selection"] = st.session_state.pop("pending_selection")
     selected_tickers = st.multiselect(
         T("companies"),
-        options=TICKERS,
+        options=_ticker_options(),
         format_func=_company_label,
         key="company_selection",
         on_change=_sync_company_pickers,
-        help="Pick companies to compare, or use Explore companies on a sector card.",
+        accept_new_options=True,
+        filter_mode="contains",  # fuzzy matching picked unrelated companies when Enter was pressed
+        placeholder="Pick or type any US ticker",
+        help="Pick companies to compare, or type any US-listed ticker (e.g. NFLX) and press Enter. "
+        "Or use Explore companies on a sector card.",
     )
+    if any(ticker not in _ticker_options() for ticker in selected_tickers):
+        _register_new_tickers(selected_tickers, sec_email)
+    for rejected in st.session_state.pop("ticker_notice", []):
+        st.warning(f"'{rejected}' isn't in the SEC company list, so it was removed.", icon=":material/warning:")
     if not is_guest and st.button(T("save_defaults"), icon=":material/bookmark:", width="stretch"):
         st.session_state["user"] = user_store.update_preferences(
             current_user["username"],
@@ -1119,6 +1213,16 @@ user_limits = RateLimits(
 st.title(T("page_title"))
 st.markdown(T("page_intro"))
 
+if not st.session_state.get("welcome_hidden"):
+    with st.container(border=True, key="welcome-card"):
+        st.markdown("##### :material/waving_hand: New here? Market Lens in 30 seconds")
+        st.markdown(APP_IN_ONE_LINE)
+        st.markdown("\n".join(f"{number}. {step}" for number, step in enumerate(QUICK_START, start=1)))
+        st.caption("The **Help & guide** tab (the last tab) has a tour of every tab and explains every term.")
+        if st.button("Got it, hide this", key="welcome-hide", icon=":material/check:", type="tertiary"):
+            st.session_state["welcome_hidden"] = True
+            st.rerun()
+
 st.subheader(T("explore_heading"))
 st.caption(T("explore_caption"))
 for row_start in range(0, len(SECTORS), 3):
@@ -1142,11 +1246,14 @@ for row_start in range(0, len(SECTORS), 3):
                     width="stretch",
                 )
 
-overview, analytics_tab, events_tab, private_tab, shortlist, assistant, filings, evaluation_tab, monitoring, guide = st.tabs(
+overview, valuation_tab, analytics_tab, events_tab, calendar_tab, watchlist_tab, private_tab, shortlist, assistant, filings, evaluation_tab, monitoring, guide = st.tabs(
     [
         T("tab_overview"),
+        T("tab_valuation"),
         T("tab_analytics"),
         T("tab_events"),
+        T("tab_calendar"),
+        T("tab_watchlist"),
         T("tab_private"),
         T("tab_shortlist"),
         T("tab_assistant"),
@@ -1212,11 +1319,23 @@ with overview:
         latest = frame.sort_values("fiscal_year").groupby("ticker", as_index=False).tail(1)
         with st.container(horizontal=True):
             for row in latest.to_dict("records"):
+                currency = row.get("reported_currency") if isinstance(row.get("reported_currency"), str) else "USD"
                 st.metric(
                     f"{row['company']} · FY{row['fiscal_year']}",
                     f"${row['value_usd'] / 1_000_000_000:,.1f}B",
                     border=True,
+                    help=None if currency == "USD" else (
+                        f"Reported as {row['reported_value'] / 1_000_000_000:,.1f}B {currency}, "
+                        f"converted at about {row['usd_rate']:.3f} USD per {currency} (that year's average rate)."
+                    ),
                 )
+        foreign = sorted({row.get("reported_currency") for row in overview_rows} - {None, "USD"})
+        if foreign:
+            st.caption(
+                f":material/currency_exchange: Some companies report in {', '.join(foreign)}. Their figures are converted to "
+                "US dollars at each year's average exchange rate, so part of a year-to-year change can come from the "
+                "exchange rate rather than the business. Hover a figure to see the original amount."
+            )
         chart_data = frame.pivot(index="fiscal_year", columns="ticker", values="value_usd").sort_index()
         st.subheader(f"{METRICS[st.session_state.get('overview_metric', metric_key)]['label']} by fiscal year")
         st.line_chart(
@@ -1244,6 +1363,69 @@ def _cached_events(ticker: str, days: int, user_agent: str) -> list[dict[str, An
     return get_company_events(ticker, user_agent, days=days, limit=25)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_quote(ticker: str) -> dict[str, Any] | None:
+    try:
+        return get_quote(ticker)
+    except (PriceDataError, RequestException, ValueError):
+        return None
+
+
+def _quotes(tickers: list[str]) -> dict[str, dict[str, Any]]:
+    unique = list(dict.fromkeys(tickers))
+    return {ticker: quote for ticker in unique if (quote := _cached_quote(ticker))}
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_price_series(ticker: str, range_key: str) -> list[dict[str, Any]]:
+    try:
+        return price_series(ticker, range_key)
+    except (PriceDataError, RequestException, ValueError):
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_valuation(ticker: str, user_agent: str) -> dict[str, Any] | None:
+    quote = _cached_quote(ticker)
+    return get_valuation(ticker, user_agent, quote) if quote else None
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def _cached_calendar(kind: str, api_key: str) -> list[dict[str, Any]]:
+    return earnings_calendar(api_key) if kind == "earnings" else ipo_calendar(api_key)
+
+
+def _user_lists() -> dict[str, list[Any]]:
+    """Watchlist, holdings and alerts: saved to the account, or kept for this visit only for guests."""
+    owner = "" if is_guest else current_user["username"]
+    if st.session_state.get("user_lists_owner") != owner or "user_lists" not in st.session_state:
+        st.session_state["user_lists"] = user_store.get_lists(owner) if owner else {key: [] for key in USER_LISTS}
+        st.session_state["user_lists_owner"] = owner
+    return st.session_state["user_lists"]
+
+
+def _save_watchlist_picker() -> None:
+    """Runs before the page redraws: clean the picked tickers, save them, and show only the valid ones."""
+    picked = st.session_state.get("watchlist_picker", [])
+    kept, notices = [], []
+    for value in picked:
+        try:
+            kept += clean_watchlist([value])
+        except ValueError as error:
+            notices.append(str(error))
+    kept = list(dict.fromkeys(kept))
+    _save_user_list("watchlist_items", kept)
+    st.session_state["watchlist_picker"] = kept
+    if notices:
+        st.session_state["watchlist_notice"] = notices
+
+
+def _save_user_list(key: str, items: list[Any]) -> None:
+    _user_lists()[key] = items
+    if not is_guest:
+        user_store.save_list(current_user["username"], key, items)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_private_funding(company_key: str, user_agent: str) -> dict[str, Any]:
     return get_private_funding(company_key, user_agent)
@@ -1252,6 +1434,8 @@ def _cached_private_funding(company_key: str, user_agent: str) -> dict[str, Any]
 def _usd_short(value: float | None) -> str:
     if value is None:
         return "—"
+    if abs(value) >= 1e12:
+        return f"${value / 1e12:,.2f}T"
     for size, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
         if abs(value) >= size:
             return f"${value / size:,.1f}{suffix}"
@@ -1297,6 +1481,140 @@ def _percent(value: Any) -> str:
     return "—" if value is None or pd.isna(value) else f"{value:.1%}"
 
 
+with valuation_tab:
+    st.subheader("Prices & valuation")
+    st.caption(
+        "Share prices from Yahoo Finance (may be delayed) combined with SEC-reported earnings, revenue, equity, "
+        "debt, cash and shares. Uses the companies picked in the sidebar."
+    )
+    if valuation_tab.open:
+        value_tickers = list(dict.fromkeys(selected_tickers))[:6]
+        if not value_tickers:
+            st.info("Pick companies in the sidebar to see their prices and valuation.")
+        else:
+            if len(selected_tickers) > 6:
+                st.caption("Showing the first six companies from the sidebar.")
+            price_range = st.segmented_control(
+                "Period",
+                list(PRICE_RANGES),
+                format_func={"1mo": "1 month", "6mo": "6 months", "1y": "1 year", "5y": "5 years", "max": "Max"}.get,
+                default="1y",
+                key="valuation_range",
+            ) or "1y"
+            series_frames, price_failed = [], []
+            with st.spinner("Loading prices…"):
+                for ticker in value_tickers:
+                    rows = _cached_price_series(ticker, price_range)
+                    if rows:
+                        series_frames.append(pd.DataFrame(rows).assign(ticker=ticker))
+                    else:
+                        price_failed.append(ticker)
+            if series_frames:
+                prices_frame = pd.concat(series_frames)
+                prices_frame["date"] = pd.to_datetime(prices_frame["date"])
+                single = len(series_frames) == 1
+                if single:
+                    y_field, y_title, y_format = "close:Q", "Price (USD)", "$,.2f"
+                else:  # several companies: compare % change from the start of the period
+                    first_close = prices_frame.groupby("ticker")["close"].transform("first")
+                    prices_frame["change"] = prices_frame["close"] / first_close - 1
+                    y_field, y_title, y_format = "change:Q", "Change since start of period", "+.0%"
+                chart = (
+                    alt.Chart(prices_frame)
+                    .mark_line(strokeWidth=2)
+                    .encode(
+                        x=alt.X("date:T", title=None),
+                        y=alt.Y(y_field, title=y_title, axis=alt.Axis(format=y_format), scale=alt.Scale(zero=False)),
+                        color=alt.Color(
+                            "ticker:N",
+                            title="Company",
+                            sort=value_tickers,
+                            scale=alt.Scale(domain=value_tickers, range=SERIES_COLORS[: len(value_tickers)]),
+                            legend=None if single else alt.Legend(orient="top"),
+                        ),
+                        tooltip=[
+                            alt.Tooltip("ticker:N", title="Company"),
+                            alt.Tooltip("date:T", title="Date", format="%d %b %Y"),
+                            alt.Tooltip("close:Q", title="Close", format="$,.2f"),
+                        ]
+                        + ([] if single else [alt.Tooltip("change:Q", title="Change", format="+.1%")]),
+                    )
+                    .properties(height=320)
+                )
+                st.altair_chart(chart, width="stretch")
+            if price_failed:
+                st.caption(f"No price history available right now for: {', '.join(price_failed)}.")
+
+            try:
+                user_agent = validate_sec_user_agent(sec_email)
+            except ValueError as error:
+                st.info(f"{error} It's needed for market cap and the valuation ratios.", icon=":material/info:")
+            else:
+                valuations, value_failed = [], {}
+                with st.spinner("Combining prices with SEC figures…"):
+                    for ticker in value_tickers:
+                        try:
+                            result = _cached_valuation(ticker, user_agent)
+                        except (PriceDataError, RequestException, SECClientError, ValueError) as error:
+                            value_failed[ticker] = str(error)
+                            continue
+                        if result:
+                            valuations.append(result)
+                        else:
+                            value_failed[ticker] = "no current price"
+                if valuations:
+                    if len(valuations) == 1:
+                        only = valuations[0]
+                        with st.container(horizontal=True):
+                            st.metric("Market cap", _usd_short(only["market_cap"]), border=True)
+                            st.metric("P/E", f"{only['pe']:.1f}" if only["pe"] else "—", border=True)
+                            st.metric("Price / sales", f"{only['ps']:.1f}" if only["ps"] else "—", border=True)
+                            st.metric("Price / book", f"{only['pb']:.1f}" if only["pb"] else "—", border=True)
+                    table = pd.DataFrame(
+                        [
+                            {
+                                "Company": _company_label(row["ticker"]),
+                                "Price": row["price"],
+                                "Market cap": _usd_short(row["market_cap"]),
+                                "P/E": row["pe"],
+                                "Price/sales": row["ps"],
+                                "Price/book": row["pb"],
+                                "EV/revenue": row["ev_revenue"],
+                                "Dividend yield %": row["dividend_yield_percent"],
+                                "Figures from": f"FY{row['fiscal_year']}" if row["fiscal_year"] else "—",
+                            }
+                            for row in valuations
+                        ]
+                    )
+                    st.dataframe(
+                        table,
+                        hide_index=True,
+                        width="stretch",
+                        column_config={
+                            "Price": st.column_config.NumberColumn(format="$%.2f"),
+                            "P/E": st.column_config.NumberColumn(format="%.1f", help="Price ÷ diluted earnings per share. Blank when earnings are negative."),
+                            "Price/sales": st.column_config.NumberColumn(format="%.1f", help="Market cap ÷ revenue"),
+                            "Price/book": st.column_config.NumberColumn(format="%.1f", help="Market cap ÷ shareholders' equity"),
+                            "EV/revenue": st.column_config.NumberColumn(format="%.1f", help="(Market cap + long-term debt − cash) ÷ revenue"),
+                            "Dividend yield %": st.column_config.NumberColumn(format="%.2f%%", help="Dividends paid in the last 12 months ÷ price"),
+                        },
+                    )
+                    if any(row["ticker"] in BANK_TICKERS for row in valuations):
+                        st.caption("For banks, price/book and P/E are the useful ratios; EV/revenue isn't meaningful because debt is part of their business.")
+                    with st.expander("How these are calculated", icon=":material/calculate:"):
+                        st.markdown(
+                            "- **Market cap** = price × shares outstanding (from the latest SEC filing)\n"
+                            "- **P/E** = price ÷ diluted earnings per share (latest fiscal year)\n"
+                            "- **Price/sales** = market cap ÷ revenue; **Price/book** = market cap ÷ shareholders' equity\n"
+                            "- **EV/revenue** = (market cap + long-term debt − cash) ÷ revenue\n"
+                            "- A blank ratio means the input is missing or negative (e.g. a loss-making year)."
+                        )
+                        for row in valuations:
+                            st.caption(f"{row['ticker']}: shares = {row['shares_basis']}; price as of {row['price_as_of'] or 'latest'}.")
+                    st.caption(VALUATION_NOTE + " Not investment advice.")
+                for ticker, message in value_failed.items():
+                    st.warning(f"{_company_label(ticker)}: couldn't calculate valuation ({message}).", icon=":material/warning:")
+
 with analytics_tab:
     st.subheader("Advanced analytics")
     st.caption(
@@ -1304,10 +1622,10 @@ with analytics_tab:
         "Ratios are derived values; check the underlying filings before relying on them."
     )
     # Starting value via session state: _sync_company_pickers sets it later, and a widget default would clash.
-    st.session_state.setdefault("analytics_tickers", [t for t in selected_tickers if t in TICKERS][:5] or ["AAPL", "MSFT"])
+    st.session_state.setdefault("analytics_tickers", [t for t in selected_tickers if t in _ticker_options()][:5] or ["AAPL", "MSFT"])
     analytics_tickers = st.multiselect(
         T("companies"),
-        options=TICKERS,
+        options=_ticker_options(),
         format_func=_company_label,
         max_selections=5,
         key="analytics_tickers",
@@ -1732,10 +2050,10 @@ with events_tab:
         "of events such as earnings, executive changes, deals or cybersecurity incidents."
     )
     with st.container(horizontal=True, vertical_alignment="bottom"):
-        st.session_state.setdefault("event_tickers", [t for t in selected_tickers if t in TICKERS][:5] or ["AAPL", "MSFT"])
+        st.session_state.setdefault("event_tickers", [t for t in selected_tickers if t in _ticker_options()][:5] or ["AAPL", "MSFT"])
         event_tickers = st.multiselect(
             T("companies"),
-            options=TICKERS,
+            options=_ticker_options(),
             format_func=_company_label,
             max_selections=5,
             key="event_tickers",
@@ -1874,6 +2192,344 @@ with events_tab:
                 "open the filing to check the details."
             )
 
+if _user_lists()["alerts"] and not st.session_state.get("alerts_toasted"):
+    st.session_state["alerts_toasted"] = True  # once per visit, whichever tab is open
+    _alert_prices = {t: q["price"] for t, q in _quotes([a["ticker"] for a in _user_lists()["alerts"]]).items()}
+    for _hit in triggered_alerts(_user_lists()["alerts"], _alert_prices):
+        st.toast(
+            f"{_hit['ticker']} is at ${_hit['current_price']:,.2f} ({ALERT_CONDITIONS[_hit['condition']].lower()} ${_hit['price']:,.2f})",
+            icon=":material/notifications_active:",
+        )
+
+
+with calendar_tab:
+    st.subheader("Earnings & IPO calendar")
+    st.caption("Upcoming earnings reports and IPOs for the next three months, from the Alpha Vantage calendar. Dates can move.")
+    if calendar_tab.open:
+        calendar_kind = st.segmented_control(
+            "Calendar",
+            ["earnings", "ipos"],
+            format_func={"earnings": "Earnings", "ipos": "IPOs"}.get,
+            default="earnings",
+            key="calendar_kind",
+            label_visibility="collapsed",
+        ) or "earnings"
+        try:
+            with st.spinner("Loading the calendar…"):
+                calendar = _cached_calendar(calendar_kind, market_data_key)
+        except (PriceDataError, RequestException) as error:
+            st.error(f"Couldn't load the calendar: {error}", icon=":material/error:")
+            calendar = None
+        if calendar is not None and calendar_kind == "earnings":
+            my_tickers = list(
+                dict.fromkeys(
+                    selected_tickers
+                    + _user_lists()["watchlist_items"]
+                    + [holding["ticker"] for holding in _user_lists()["holdings"]]
+                )
+            )
+            with st.container(horizontal=True, vertical_alignment="bottom"):
+                scope = st.segmented_control(
+                    "Show",
+                    ["mine", "all"],
+                    format_func={"mine": "My companies", "all": "All companies"}.get,
+                    default="mine",
+                    key="calendar_scope",
+                ) or "mine"
+                horizon = st.segmented_control(
+                    "Next",
+                    [7, 30, 92],
+                    format_func={7: "7 days", 30: "30 days", 92: "3 months"}.get,
+                    default=30,
+                    key="calendar_days",
+                ) or 30
+                search = st.text_input("Search", placeholder="Ticker or company", key="calendar_search")
+            wanted = my_tickers if scope == "mine" else [event["ticker"] for event in calendar]
+            rows = upcoming_for(calendar, wanted, days=int(horizon))
+            if search.strip():
+                needle = search.strip().lower()
+                rows = [row for row in rows if needle in row["ticker"].lower() or needle in row["name"].lower()]
+            if scope == "mine":
+                st.caption("My companies = the sidebar selection plus your watchlist and portfolio: " + ", ".join(my_tickers))
+            if not rows:
+                st.info("No earnings reports scheduled in this period for these companies.")
+            else:
+                st.metric("Reports in this period", len(rows))
+                st.dataframe(
+                    pd.DataFrame(rows).rename(
+                        columns={
+                            "date": "Date",
+                            "time": "Time",
+                            "ticker": "Ticker",
+                            "name": "Company",
+                            "eps_estimate": "EPS estimate",
+                            "fiscal_period_end": "Quarter ending",
+                        }
+                    )[["Date", "Time", "Ticker", "Company", "EPS estimate", "Quarter ending"]],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={"EPS estimate": st.column_config.NumberColumn(format="$%.2f")},
+                )
+        elif calendar is not None:
+            if not calendar:
+                st.info("No IPOs are scheduled in the next three months.")
+            else:
+                st.metric("Upcoming IPOs", len(calendar))
+                st.dataframe(
+                    pd.DataFrame(calendar).rename(
+                        columns={
+                            "date": "Date",
+                            "ticker": "Ticker",
+                            "name": "Company",
+                            "exchange": "Exchange",
+                            "price_low": "Price low",
+                            "price_high": "Price high",
+                        }
+                    )[["Date", "Ticker", "Company", "Exchange", "Price low", "Price high"]],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Price low": st.column_config.NumberColumn(format="$%.2f"),
+                        "Price high": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
+                st.caption("A blank price range means the company hasn't set one yet.")
+        if not market_data_key.strip():
+            st.caption(
+                "Using Alpha Vantage's public demo access. Add your own free Alpha Vantage key in the sidebar "
+                "if the calendar stops loading."
+            )
+
+with watchlist_tab:
+    st.subheader("Watchlist & portfolio")
+    st.caption(
+        ("Saved to your account." if not is_guest else "Guest mode: your lists last for this visit only. Create an account to keep them.")
+        + " Prices from Yahoo Finance, refreshed every 5 minutes; dividends per share from SEC filings."
+    )
+    if watchlist_tab.open:
+        lists = _user_lists()
+        watch_part, portfolio_part, alerts_part, dividends_part = st.tabs(["Watchlist", "Portfolio", "Price alerts", "Dividends"])
+
+        with watch_part:
+            st.session_state.setdefault("watchlist_picker", list(lists["watchlist_items"]))
+            st.multiselect(
+                "Companies to watch",
+                options=list(dict.fromkeys(_ticker_options() + lists["watchlist_items"] + st.session_state["watchlist_picker"])),
+                format_func=_company_label,
+                accept_new_options=True,
+                filter_mode="contains",
+                placeholder="Pick or type any US ticker",
+                key="watchlist_picker",
+                on_change=_save_watchlist_picker,
+            )
+            for message in st.session_state.pop("watchlist_notice", []):
+                st.warning(message, icon=":material/warning:")
+            cleaned = lists["watchlist_items"]
+            if not cleaned:
+                st.info("Add companies above to follow their price, dividend yield and next earnings date.")
+            else:
+                with st.spinner("Loading prices…"):
+                    quotes = _quotes(cleaned)
+                try:
+                    upcoming = {
+                        event["ticker"]: event["date"]
+                        for event in upcoming_for(_cached_calendar("earnings", market_data_key), cleaned, days=92)
+                    }
+                except (PriceDataError, RequestException):
+                    upcoming = {}
+                table = pd.DataFrame(
+                    [
+                        {
+                            "Company": _company_label(ticker)
+                            if _company_label(ticker) != ticker
+                            else f"{quotes.get(ticker, {}).get('name') or ticker} ({ticker})",
+                            "Price": quotes.get(ticker, {}).get("price"),
+                            "Day %": quotes.get(ticker, {}).get("change_percent"),
+                            "52-week low": quotes.get(ticker, {}).get("low_52w"),
+                            "52-week high": quotes.get(ticker, {}).get("high_52w"),
+                            "Dividend yield %": quotes.get(ticker, {}).get("dividend_yield"),
+                            "Next earnings": upcoming.get(ticker, "—"),
+                        }
+                        for ticker in cleaned
+                    ]
+                )
+                st.dataframe(
+                    table,
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "Price": st.column_config.NumberColumn(format="$%.2f"),
+                        "Day %": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "52-week low": st.column_config.NumberColumn(format="$%.2f"),
+                        "52-week high": st.column_config.NumberColumn(format="$%.2f"),
+                        "Dividend yield %": st.column_config.NumberColumn(
+                            format="%.2f%%", help="Dividends paid in the last 12 months ÷ price"
+                        ),
+                    },
+                )
+                missing = [ticker for ticker in cleaned if ticker not in quotes]
+                if missing:
+                    st.caption(f"No price available right now for: {', '.join(missing)}.")
+
+        with portfolio_part:
+            st.caption("Enter what you own. Add rows with the + button, delete with the bin icon, then press **Save portfolio**.")
+            with st.form("portfolio_form", border=False):
+                edited = st.data_editor(
+                    pd.DataFrame(
+                        lists["holdings"] or [{"ticker": "", "shares": None, "cost_per_share": None}],
+                        columns=["ticker", "shares", "cost_per_share"],
+                    ).astype({"ticker": "string", "shares": float, "cost_per_share": float}),
+                    num_rows="dynamic",
+                    hide_index=True,
+                    width="stretch",
+                    key="holdings_editor",
+                    column_config={
+                        "ticker": st.column_config.TextColumn("Ticker", max_chars=10),
+                        "shares": st.column_config.NumberColumn("Shares", min_value=0.0, format="%.4g"),
+                        "cost_per_share": st.column_config.NumberColumn("Cost per share ($)", min_value=0.0, format="$%.2f"),
+                    },
+                )
+                if st.form_submit_button("Save portfolio", type="primary", icon=":material/save:"):
+                    try:
+                        _save_user_list("holdings", clean_holdings(edited.to_dict("records")))
+                        st.toast("Portfolio saved.", icon=":material/check:")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error), icon=":material/error:")
+            holdings = lists["holdings"]
+            if holdings:
+                with st.spinner("Loading prices…"):
+                    prices = {ticker: quote["price"] for ticker, quote in _quotes([h["ticker"] for h in holdings]).items()}
+                valuation = value_holdings(holdings, prices)
+                with st.container(horizontal=True):
+                    st.metric("Market value", f"${valuation['total_value']:,.2f}", border=True)
+                    st.metric("Cost", f"${valuation['total_cost']:,.2f}", border=True)
+                    st.metric(
+                        "Gain / loss",
+                        f"${valuation['total_gain']:,.2f}",
+                        f"{valuation['total_gain_percent']:+.2f}%",
+                        border=True,
+                    )
+                frame = pd.DataFrame(valuation["rows"])
+                st.dataframe(
+                    frame[["ticker", "shares", "cost_per_share", "price", "value", "gain", "gain_percent", "weight_percent"]],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "ticker": "Ticker",
+                        "shares": "Shares",
+                        "cost_per_share": st.column_config.NumberColumn("Cost/share", format="$%.2f"),
+                        "price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                        "value": st.column_config.NumberColumn("Value", format="dollar"),
+                        "gain": st.column_config.NumberColumn("Gain", format="dollar"),
+                        "gain_percent": st.column_config.NumberColumn("Gain %", format="%+.2f%%"),
+                        "weight_percent": st.column_config.ProgressColumn("Weight", format="%.1f%%", min_value=0, max_value=100),
+                    },
+                )
+                if valuation["missing_prices"]:
+                    st.caption(f"No price for {', '.join(valuation['missing_prices'])}: counted at cost.")
+                st.caption("For tracking only, not investment advice. Prices can be delayed.")
+
+        with alerts_part:
+            st.caption("Get a notice when a price crosses your level. Alerts are checked whenever you open the app.")
+            with st.form("alerts_form", border=False):
+                edited_alerts = st.data_editor(
+                    pd.DataFrame(
+                        lists["alerts"] or [{"ticker": "", "condition": "above", "price": None}],
+                        columns=["ticker", "condition", "price"],
+                    ).astype({"ticker": "string", "price": float}),
+                    num_rows="dynamic",
+                    hide_index=True,
+                    width="stretch",
+                    key="alerts_editor",
+                    column_config={
+                        "ticker": st.column_config.TextColumn("Ticker", max_chars=10),
+                        "condition": st.column_config.SelectboxColumn(
+                            "When", options=list(ALERT_CONDITIONS), default="above", format_func=ALERT_CONDITIONS.get
+                        ),
+                        "price": st.column_config.NumberColumn("Price ($)", min_value=0.0, format="$%.2f"),
+                    },
+                )
+                if st.form_submit_button("Save alerts", type="primary", icon=":material/notifications:"):
+                    try:
+                        _save_user_list("alerts", clean_alerts(edited_alerts.to_dict("records")))
+                        st.session_state.pop("alerts_toasted", None)
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error), icon=":material/error:")
+            if lists["alerts"]:
+                alert_quotes = _quotes([alert["ticker"] for alert in lists["alerts"]])
+                hits = triggered_alerts(lists["alerts"], {ticker: quote["price"] for ticker, quote in alert_quotes.items()})
+                for hit in hits:
+                    st.warning(
+                        f"**{hit['ticker']}** is at ${hit['current_price']:,.2f}: "
+                        f"{ALERT_CONDITIONS[hit['condition']].lower()} ${hit['price']:,.2f}.",
+                        icon=":material/notifications_active:",
+                    )
+                if not hits:
+                    st.success("No alerts triggered right now.", icon=":material/check:")
+
+        with dividends_part:
+            div_ticker = st.selectbox(
+                "Company",
+                options=list(
+                    dict.fromkeys(lists["watchlist_items"] + [h["ticker"] for h in lists["holdings"]] + _ticker_options())
+                ),
+                format_func=_company_label,
+                key="dividend_ticker",
+            )
+            try:
+                user_agent = validate_sec_user_agent(sec_email)
+                with st.spinner("Reading dividends from SEC filings…"):
+                    per_share = _cached_metrics(div_ticker, "dividends_per_share", 10, user_agent)
+                    paid = _cached_metrics(div_ticker, "dividends_paid", 10, user_agent)
+                    income = _cached_metrics(div_ticker, "net_income", 10, user_agent)
+            except ValueError as error:
+                st.info(str(error), icon=":material/info:")
+            except (RequestException, SECClientError) as error:
+                st.error(f"Couldn't load SEC data: {error}", icon=":material/error:")
+            else:
+                quote = _cached_quote(div_ticker) or {}
+                if not per_share and not paid:
+                    st.info(f"{_company_label(div_ticker)} reports no dividends in its SEC filings.")
+                else:
+                    income_by_year = {row["fiscal_year"]: row["value_usd"] for row in income}
+                    paid_by_year = {row["fiscal_year"]: row["value_usd"] for row in paid}
+                    latest_dps = per_share[-1] if per_share else None
+                    latest_paid_year = max(paid_by_year) if paid_by_year else None
+                    payout = (
+                        paid_by_year[latest_paid_year] / income_by_year[latest_paid_year] * 100
+                        if latest_paid_year and income_by_year.get(latest_paid_year)
+                        else None
+                    )
+                    with st.container(horizontal=True):
+                        st.metric(
+                            f"Dividend per share (FY{latest_dps['fiscal_year']})" if latest_dps else "Dividend per share",
+                            f"${latest_dps['value_usd']:.2f}" if latest_dps else "—",
+                            border=True,
+                        )
+                        st.metric(
+                            "Yield (last 12 months)",
+                            f"{quote['dividend_yield']:.2f}%" if quote.get("dividend_yield") else "—",
+                            border=True,
+                        )
+                        st.metric(
+                            f"Payout ratio (FY{latest_paid_year})" if payout is not None else "Payout ratio",
+                            f"{payout:.0f}%" if payout is not None else "—",
+                            border=True,
+                            help="Dividends paid ÷ net income",
+                        )
+                    if per_share:
+                        chart_frame = pd.DataFrame(
+                            [{"Fiscal year": str(row["fiscal_year"]), "Dividend per share ($)": row["value_usd"]} for row in per_share]
+                        )
+                        st.bar_chart(chart_frame, x="Fiscal year", y="Dividend per share ($)", color=SERIES_COLORS[2], height=280)
+                    st.caption(
+                        "Dividends per share and dividends paid come from the company's 10-K filings (SEC company facts); "
+                        "yield uses Yahoo Finance prices. Per-share amounts are as reported at the time, so years before "
+                        "a stock split look higher (Apple's 2020 4-for-1 split, for example)."
+                    )
+
 with private_tab:
     st.subheader("Private companies")
     st.caption(
@@ -1959,7 +2615,7 @@ with shortlist:
     with st.form("research_screen_form"):
         screen_tickers = st.multiselect(
             "Companies to screen",
-            options=TICKERS,
+            options=_ticker_options(),
             default=["AAPL", "MSFT"],
             format_func=_company_label,
             max_selections=5,
@@ -2353,7 +3009,7 @@ with filings:
     )
     ingest_col, status_col = st.columns([1, 2], vertical_alignment="bottom")
     with ingest_col:
-        ingest_ticker = st.selectbox("Company to index", options=TICKERS, format_func=_company_label, key="ingest_ticker")
+        ingest_ticker = st.selectbox("Company to index", options=_ticker_options(), format_func=_company_label, key="ingest_ticker")
         ingest_years = st.slider("10-K filings to load", 1, 10, 3, key="ingest_years")
     with status_col:
         if st.button("Fetch and index filings", type="primary", icon=":material/library_add:"):
@@ -2943,6 +3599,39 @@ with monitoring:
 
 
 with guide:
+    st.subheader("What is Market Lens?")
+    st.markdown(APP_IN_ONE_LINE)
+    st.markdown("\n".join(f"{number}. {step}" for number, step in enumerate(QUICK_START, start=1)))
+    st.caption("Market Lens is for learning and research. It explains what companies reported; it doesn't tell you what to buy or sell.")
+
+    st.subheader("Tour of the tabs")
+    st.dataframe(
+        [{"Tab": tab, "What it shows": shows, "Use it to…": use} for tab, shows, use in TAB_TOUR],
+        hide_index=True,
+        width="stretch",
+    )
+
+    st.subheader("Glossary: what the terms mean")
+    glossary_query = st.text_input(
+        "Search the glossary",
+        key="glossary_query",
+        placeholder="e.g. 10-K, net margin, EPS, RAG",
+        icon=":material/search:",
+    )
+    if glossary_query.strip():
+        matches = search_glossary(glossary_query)
+        if not matches:
+            st.caption("No term matches that. Try a shorter word, or ask the guide below.")
+        for entry in matches:
+            with st.container(border=True):
+                st.markdown(f"**{entry['term']}** · :gray[{entry['category']}]")
+                st.markdown(f"{entry['meaning']}\n\n:gray[**Why it matters:** {entry['why']}]")
+    else:
+        for category, entries in GLOSSARY.items():
+            with st.expander(f"{category} ({len(entries)} terms)"):
+                for term, meaning, why, _aliases in entries:
+                    st.markdown(f"**{term}**: {meaning}  \n:gray[*Why it matters:* {why}]")
+
     st.subheader("Setup checklist")
     try:
         validate_sec_user_agent(sec_email)
@@ -2955,14 +3644,20 @@ with guide:
         index_ready = False
     checklist = [
         (email_ready, "SEC contact email", "Needed for all SEC data. Add it in the sidebar."),
-        (bool(chat_key.strip()), f"{provider.key_label} ({provider.label})", "Needed for the research assistant with the chosen provider."),
-        (bool(openrouter_key.strip()), "OpenRouter API key", "Needed for filing search (embeddings), whichever chat provider you use."),
+        (
+            bool(chat_key.strip()),
+            "AI key" if using_shared_key else f"{provider.key_label} ({provider.label})",
+            "Needed for the research assistant with the chosen provider.",
+        ),
+        (bool(openrouter_key.strip()), "Filing search key", "Needed for filing search (embeddings), whichever chat provider you use."),
         (index_ready, "Filings indexed", "Index at least one company in the Filing library to ask about 10-K text."),
         (bool(market_data_key.strip()), "Alpha Vantage key (optional)", "Only needed for stock quotes."),
     ]
     for done, label, detail in checklist:
         icon = ":material/check_circle:" if done else ":material/radio_button_unchecked:"
-        st.markdown(f"{icon} **{label}** — {'ready' if done else detail}")
+        shared = (label == "AI key" and using_shared_key) or (label == "Filing search key" and shared_embeddings)
+        status = "ready (the app's shared key)" if shared else "ready"
+        st.markdown(f"{icon} **{label}** — {status if done else detail}")
 
     st.subheader("Ask the guide")
     st.caption("A built-in helper for using Market Lens. It works without any API key.")

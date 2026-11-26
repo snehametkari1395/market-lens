@@ -11,3 +11,4 @@ data/eval/
 data/experiment.json
 
 data/smoke/
+data/ratelimit_state.json

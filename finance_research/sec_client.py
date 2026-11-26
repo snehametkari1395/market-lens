@@ -22,30 +22,37 @@ METRICS: dict[str, dict[str, Any]] = {
             "SalesRevenueNet",
             "RevenuesNetOfInterestExpense",  # banks such as Goldman Sachs report net revenue
         ),
+        "ifrs_tags": ("Revenue", "RevenueFromContractsWithCustomers"),
     },
     "research_and_development": {
         "label": "Research and development",
         "tags": ("ResearchAndDevelopmentExpense",),
+        "ifrs_tags": ("ResearchAndDevelopmentExpense",),
     },
     "operating_income": {
         "label": "Operating income",
         "tags": ("OperatingIncomeLoss",),
+        "ifrs_tags": ("ProfitLossFromOperatingActivities",),
     },
     "net_income": {
         "label": "Net income",
         "tags": ("NetIncomeLoss",),
+        "ifrs_tags": ("ProfitLossAttributableToOwnersOfParent", "ProfitLoss"),
     },
     "total_assets": {
         "label": "Total assets",
         "tags": ("Assets",),
+        "ifrs_tags": ("Assets",),
     },
     "operating_cash_flow": {
         "label": "Operating cash flow",
         "tags": ("NetCashProvidedByUsedInOperatingActivities",),
+        "ifrs_tags": ("CashFlowsFromUsedInOperatingActivities",),
     },
     "total_liabilities": {
         "label": "Total liabilities",
         "tags": ("Liabilities",),
+        "ifrs_tags": ("Liabilities",),
     },
     "stockholders_equity": {
         "label": "Shareholders' equity",
@@ -53,6 +60,7 @@ METRICS: dict[str, dict[str, Any]] = {
             "StockholdersEquity",
             "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
         ),
+        "ifrs_tags": ("EquityAttributableToOwnersOfParent", "Equity"),
     },
     "cash": {
         "label": "Cash and cash equivalents",
@@ -61,15 +69,29 @@ METRICS: dict[str, dict[str, Any]] = {
             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
             "Cash",
         ),
+        "ifrs_tags": ("CashAndCashEquivalents",),
     },
     "long_term_debt": {
         "label": "Long-term debt",
         "tags": ("LongTermDebt", "LongTermDebtNoncurrent"),
+        "ifrs_tags": ("NoncurrentPortionOfNoncurrentBorrowings", "LongtermBorrowings"),
     },
     "eps_diluted": {
         "label": "Diluted earnings per share",
         "tags": ("EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"),
+        "ifrs_tags": ("DilutedEarningsLossPerShare", "BasicAndDilutedEarningsLossPerShare"),
         "unit": "USD/shares",
+    },
+    "dividends_per_share": {
+        "label": "Dividends per share",
+        "tags": ("CommonStockDividendsPerShareDeclared", "CommonStockDividendsPerShareCashPaid"),
+        "ifrs_tags": ("DividendsRecognisedAsDistributionsToOwnersPerShare",),
+        "unit": "USD/shares",
+    },
+    "dividends_paid": {
+        "label": "Dividends paid",
+        "tags": ("PaymentsOfDividendsCommonStock", "PaymentsOfDividends"),
+        "ifrs_tags": ("DividendsPaidClassifiedAsFinancingActivities", "DividendsPaid"),
     },
 }
 # Metrics shown in USD totals (charts in billions); per-share figures are excluded.
@@ -80,6 +102,7 @@ RATIOS: dict[str, tuple[str, ...]] = {
     "operating_margin": ("operating_income", "revenue"),
     "net_margin": ("net_income", "revenue"),
     "research_intensity": ("research_and_development", "revenue"),
+    "payout_ratio": ("dividends_paid", "net_income"),
 }
 
 
@@ -179,7 +202,56 @@ def get_company_facts(ticker: str, user_agent: str) -> tuple[dict[str, Any], dic
     return company, facts
 
 
-ANNUAL_FORMS = {"10-K", "10-K/A"}
+# US companies file a 10-K each year; foreign companies listed in the US file a 20-F (or a 40-F from Canada).
+ANNUAL_FORMS = {"10-K", "10-K/A", "20-F", "20-F/A", "40-F", "40-F/A"}
+
+# US companies tag figures with US GAAP concepts; companies reporting under IFRS (most of Europe) use ifrs-full.
+TAXONOMIES = ("us-gaap", "ifrs-full")
+
+# Approximate yearly average exchange rates (US dollars per unit of currency, ECB/Fed reference averages),
+# so European figures can be compared with US companies. Years after the last entry use the last known rate.
+USD_PER_UNIT: dict[str, dict[int, float]] = {
+    "EUR": {2015: 1.110, 2016: 1.107, 2017: 1.130, 2018: 1.181, 2019: 1.120, 2020: 1.142,
+            2021: 1.183, 2022: 1.053, 2023: 1.081, 2024: 1.082, 2025: 1.130},
+    "GBP": {2015: 1.528, 2016: 1.355, 2017: 1.289, 2018: 1.335, 2019: 1.277, 2020: 1.284,
+            2021: 1.375, 2022: 1.237, 2023: 1.243, 2024: 1.278, 2025: 1.320},
+    "CHF": {2015: 1.040, 2016: 1.015, 2017: 1.016, 2018: 1.023, 2019: 1.006, 2020: 1.066,
+            2021: 1.094, 2022: 1.048, 2023: 1.113, 2024: 1.136, 2025: 1.210},
+}
+USD_PER_UNIT["DKK"] = {year: rate / 7.45 for year, rate in USD_PER_UNIT["EUR"].items()}  # the krone is pegged to the euro
+
+# Ordinary shares represented by one US-listed share (ADR), so per-share figures match the price traded in the US.
+SHARES_PER_US_LISTING: dict[str, float] = {"AZN": 0.5, "FMS": 0.5, "EVO": 0.5, "SHEL": 2.0}
+
+
+def usd_rate(currency: str, year: int) -> float | None:
+    """US dollars per unit of `currency` in `year` (1.0 for USD); None for a currency without rates."""
+    if currency == "USD":
+        return 1.0
+    rates = USD_PER_UNIT.get(currency)
+    if not rates:
+        return None
+    if year in rates:
+        return rates[year]
+    return rates[max(rates)] if year > max(rates) else rates[min(rates)]
+
+
+def shares_per_us_listing(ticker: str) -> float:
+    return SHARES_PER_US_LISTING.get(ticker.upper(), 1.0)
+
+
+def _pick_unit(units: dict[str, list[dict[str, Any]]], per_share: bool) -> str | None:
+    """The unit a concept is mostly reported in (e.g. EUR for SAP), preferring USD on a tie."""
+    candidates = []
+    for unit, entries in units.items():
+        currency, _, rest = unit.partition("/")
+        if per_share != (rest == "shares") or len(currency) != 3 or not currency.isupper():
+            continue
+        if currency != "USD" and currency not in USD_PER_UNIT:
+            continue
+        annual = sum(1 for entry in entries if entry.get("form") in ANNUAL_FORMS)
+        candidates.append((annual, currency == "USD", unit))
+    return max(candidates)[2] if candidates and max(candidates)[0] else None
 
 
 def _period_days(item: dict[str, Any]) -> int | None:
@@ -255,34 +327,55 @@ def extract_metric_records(
     if not 1 <= years <= 10:
         raise ValueError("Years must be between 1 and 10.")
 
-    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+    all_facts = facts.get("facts", {})
     unit = METRICS[metric].get("unit", "USD")
-    cutoff_year = max(
-        (
-            int(entry["fy"])
-            for concept in us_gaap.values()
-            for unit_entries in concept.get("units", {}).values()
-            for entry in unit_entries
-            if entry.get("form") in {"10-K", "10-K/A"}
-            and entry.get("fp") == "FY"
-            and isinstance(entry.get("fy"), int)
-        ),
-        default=0,
-    ) - years + 1
-    available_by_year: dict[int, dict[str, Any]] = {}
+    per_share = unit.endswith("/shares")
+
+    def latest_year(taxonomy: str) -> int:
+        return max(
+            (
+                int(entry["fy"])
+                for concept in all_facts.get(taxonomy, {}).values()
+                for unit_entries in concept.get("units", {}).values()
+                for entry in unit_entries
+                if entry.get("form") in ANNUAL_FORMS and entry.get("fp") == "FY" and isinstance(entry.get("fy"), int)
+            ),
+            default=0,
+        )
+
+    newest = {taxonomy: latest_year(taxonomy) for taxonomy in TAXONOMIES}
+    cutoff_year = max(newest.values()) - years + 1
+    # The taxonomy with the newest annual data goes first (e.g. Fresenius moved from US GAAP to IFRS).
+    tag_sources = [
+        (taxonomy, tag)
+        for taxonomy in sorted(TAXONOMIES, key=lambda name: -newest[name])
+        for tag in METRICS[metric]["tags" if taxonomy == "us-gaap" else "ifrs_tags"]
+    ]
+    available_by_year: dict[int, tuple[dict[str, Any], str]] = {}
 
     # Tags are tried in order; a later tag only fills years the earlier ones don't cover
     # (companies sometimes switch revenue tags between years).
-    for tag in METRICS[metric]["tags"]:
-        concept = us_gaap.get(tag)
+    for taxonomy, tag in tag_sources:
+        concept = all_facts.get(taxonomy, {}).get(tag)
         if not concept:
             continue
-        for year, item in _annual_values(concept.get("units", {}).get(unit, [])).items():
+        units = concept.get("units", {})
+        reported_unit = _pick_unit(units, per_share)  # SAP, say, adds a few USD convenience figures to its EUR ones
+        if not reported_unit:
+            continue
+        for year, item in _annual_values(units.get(reported_unit, [])).items():
             if year >= cutoff_year and year not in available_by_year:
-                available_by_year[year] = item
+                available_by_year[year] = (item, reported_unit.split("/")[0])
 
     records: list[dict[str, Any]] = []
-    for year, item in sorted(available_by_year.items()):
+    for year, (item, currency) in sorted(available_by_year.items()):
+        rate = usd_rate(currency, _period_year(item["end"]) if item.get("end") else year)
+        if rate is None:
+            continue
+        reported_value = float(item["val"])
+        if metric == "dividends_paid":
+            reported_value = abs(reported_value)  # IFRS cash-flow statements often show payments as negatives
+        value = reported_value * rate * (shares_per_us_listing(company["ticker"]) if per_share else 1.0)
         accession = str(item.get("accn", ""))
         accession_path = accession.replace("-", "")
         source_url = ""
@@ -295,8 +388,11 @@ def extract_metric_records(
                 "metric": metric,
                 "metric_label": METRICS[metric]["label"],
                 "fiscal_year": year,
-                "value_usd": float(item["val"]),
+                "value_usd": value,
                 "unit": unit,
+                "reported_currency": currency,
+                "reported_value": reported_value,
+                "usd_rate": rate,
                 "period_end": str(item.get("end", "")),
                 "filed": str(item.get("filed", "")),
                 "accession": accession,
@@ -325,7 +421,7 @@ def get_recent_10k_filings(
     forms = recent.get("form", [])
     filings: list[dict[str, Any]] = []
     for index, form in enumerate(forms):
-        if form not in {"10-K", "10-K/A"}:
+        if form not in ANNUAL_FORMS:
             continue
         accession = recent["accessionNumber"][index]
         document = recent["primaryDocument"][index]
@@ -338,6 +434,7 @@ def get_recent_10k_filings(
                 "ticker": company["ticker"],
                 "company": company["name"],
                 "report_year": report_year,
+                "form": form,
                 "filed": filed,
                 "accession": accession,
                 "document_url": f"{SEC_ARCHIVES}/{company['cik']}/{accession_path}/{document}",

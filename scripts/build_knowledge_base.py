@@ -1,4 +1,4 @@
-"""Index the latest 10-K of a set of companies into data/chroma, so the app starts with a knowledge base.
+"""Index the latest annual report (10-K, or 20-F for European companies) of a set of companies into data/chroma, so the app starts with a knowledge base.
 
 Usage (PowerShell, from the project folder):
 
@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # One well-known company from each of the main sectors.
-DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "JPM", "AMZN", "TSLA", "JNJ", "XOM"]
+DEFAULT_TICKERS = ["AAPL", "MSFT", "NVDA", "JPM", "AMZN", "TSLA", "JNJ", "XOM", "SAP", "ASML"]
 EMBEDDING_PRICE_PER_CHUNK = 350 * 0.02 / 1_000_000  # ~1,400 characters (~350 tokens) per chunk
 
 

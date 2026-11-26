@@ -241,7 +241,7 @@ def test_mcp_server_exposes_the_research_tools(store) -> None:
         return names, result
 
     names, result = asyncio.run(scenario())
-    assert names == ["calculate_financial_ratio", "compare_companies", "fetch_sec_financials", "fetch_stock_quote", "get_company_events", "get_private_company_funding", "search_filing_knowledge"]
+    assert names == ["calculate_financial_ratio", "compare_companies", "fetch_sec_financials", "fetch_stock_quote", "get_company_events", "get_private_company_funding", "get_upcoming_earnings", "get_valuation", "search_filing_knowledge"]
     text = json.dumps(result, default=str)
     assert "dividends" in text and "keyword" in text
 
