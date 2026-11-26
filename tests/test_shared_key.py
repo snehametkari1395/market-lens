@@ -72,3 +72,10 @@ def test_shared_allowance_stops_the_assistant(monkeypatch):
     assert not at.exception, at.exception
     assert len(calls) == 1
     assert any("free AI allowance" in warning.value for warning in at.warning)
+
+
+def test_refresh_from_sec_button_runs(monkeypatch):
+    # Regression: the button cleared a cache function that was only defined further down the script.
+    at, _ = _start_as_guest(monkeypatch)
+    next(button for button in at.button if button.label == "Refresh from SEC now").click().run()
+    assert not at.exception, at.exception

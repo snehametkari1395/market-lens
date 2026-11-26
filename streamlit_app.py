@@ -185,6 +185,18 @@ def _cached_metrics(ticker: str, metric: str, years: int, user_agent: str) -> li
     return get_metric_records(ticker, metric, years, user_agent)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _analytics_records(tickers: tuple[str, ...], years: int, user_agent: str) -> list[dict[str, Any]]:
+    from finance_research.analytics import ANALYTICS_METRICS
+
+    return [
+        row
+        for ticker in tickers
+        for metric in ANALYTICS_METRICS
+        for row in _cached_metrics(ticker, metric, years, user_agent)
+    ]
+
+
 @st.cache_resource(show_spinner=False)
 def _monitor() -> Monitor:
     return Monitor(DATA_DIR / "logs")
@@ -1189,18 +1201,6 @@ with overview:
         )
     else:
         st.info("Choose companies and a metric, then load SEC data to see a sourced comparison.")
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _analytics_records(tickers: tuple[str, ...], years: int, user_agent: str) -> list[dict[str, Any]]:
-    from finance_research.analytics import ANALYTICS_METRICS
-
-    return [
-        row
-        for ticker in tickers
-        for metric in ANALYTICS_METRICS
-        for row in _cached_metrics(ticker, metric, years, user_agent)
-    ]
-
 
 PRICE_YEARS = 10
 
